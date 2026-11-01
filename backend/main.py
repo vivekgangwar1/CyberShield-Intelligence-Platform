@@ -4,13 +4,15 @@ import tempfile
 from pathlib import Path
 
 import joblib
+import numpy as np
 import pandas as pd
+import tensorflow as tf
+
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from backend.database import initialize_database, save_scan, get_connection
-
 from utils.pe_feature_extractor import extract_basic_pe_info
 
 
@@ -21,7 +23,9 @@ from utils.pe_feature_extractor import extract_basic_pe_info
 BASE_DIR = Path(__file__).resolve().parent.parent
 MODELS_DIR = BASE_DIR / "models"
 
-PHISHING_MODEL_PATH = MODELS_DIR / "phishing_url_text_model.pkl"
+PHISHING_MODEL_PATH = MODELS_DIR / "phishing_cnn.keras"
+PHISHING_ENCODER_PATH = MODELS_DIR / "phishing_cnn_encoder.pkl"
+
 INTRUSION_MODEL_PATH = MODELS_DIR / "intrusion_detection_model.pkl"
 MALWARE_MODEL_PATH = MODELS_DIR / "malware_classification_model.pkl"
 
@@ -30,28 +34,48 @@ MAX_FILE_SIZE = 100 * 1024 * 1024  # 100 MB
 
 
 # --------------------------------------------------
-# Load trained models
+# Model variables
 # --------------------------------------------------
 
 phishing_model = None
+char_to_id = {}
+MAX_LEN = 200
+
 intrusion_model = None
 malware_model = None
 malware_feature_columns = []
-malware_label_mapping = {0: "Benign", 1: "Malware"}
 
+malware_label_mapping = {
+    0: "Benign",
+    1: "Malware",
+}
+
+
+# --------------------------------------------------
+# Load trained models
+# --------------------------------------------------
 
 def load_models():
-    global phishing_model
-    global intrusion_model
-    global malware_model
-    global malware_feature_columns
-    global malware_label_mapping
+    global phishing_model, char_to_id, MAX_LEN
+    global intrusion_model, malware_model
+    global malware_feature_columns, malware_label_mapping
 
-    if PHISHING_MODEL_PATH.exists():
-        phishing_model = joblib.load(PHISHING_MODEL_PATH)
+    if PHISHING_MODEL_PATH.exists() and PHISHING_ENCODER_PATH.exists():
+        phishing_model = tf.keras.models.load_model(
+            PHISHING_MODEL_PATH
+        )
+
+        encoder_data = joblib.load(PHISHING_ENCODER_PATH)
+        char_to_id = encoder_data["char_to_id"]
+        MAX_LEN = encoder_data["max_len"]
+
+        print("CNN phishing model loaded successfully.")
+    else:
+        print("CNN phishing model or encoder not found.")
 
     if INTRUSION_MODEL_PATH.exists():
         intrusion_model = joblib.load(INTRUSION_MODEL_PATH)
+        print("Intrusion detection model loaded.")
 
     if MALWARE_MODEL_PATH.exists():
         malware_bundle = joblib.load(MALWARE_MODEL_PATH)
@@ -61,10 +85,12 @@ def load_models():
             malware_feature_columns = malware_bundle["feature_columns"]
             malware_label_mapping = malware_bundle.get(
                 "label_mapping",
-                {0: "Benign", 1: "Malware"}
+                {0: "Benign", 1: "Malware"},
             )
         else:
             malware_model = malware_bundle
+
+        print("Malware classification model loaded.")
 
 
 load_models()
@@ -77,7 +103,7 @@ load_models()
 app = FastAPI(
     title="CyberShield Intelligence Platform",
     description="Cybersecurity detection APIs",
-    version="1.0.0"
+    version="2.0.0",
 )
 
 app.add_middleware(
@@ -94,7 +120,7 @@ app.add_middleware(
 
 
 # --------------------------------------------------
-# Initialize database at startup
+# Database startup
 # --------------------------------------------------
 
 @app.on_event("startup")
@@ -126,13 +152,19 @@ def ensure_model_loaded(model, model_name):
     if model is None:
         raise HTTPException(
             status_code=503,
-            detail=f"{model_name} model is not loaded."
+            detail=f"{model_name} model is not loaded.",
         )
 
 
-def get_prediction_probability(model, features):
-    probabilities = model.predict_proba(features)[0]
-    return probabilities
+def encode_url(url: str) -> np.ndarray:
+    sequence = [
+        char_to_id.get(char, 0)
+        for char in url[:MAX_LEN]
+    ]
+
+    sequence += [0] * (MAX_LEN - len(sequence))
+
+    return np.array([sequence], dtype=np.int32)
 
 
 # --------------------------------------------------
@@ -157,7 +189,7 @@ def health_check():
 
 
 # --------------------------------------------------
-# Phishing URL Detection
+# Phishing URL Detection — CNN Deep Learning
 # --------------------------------------------------
 
 @app.post("/api/phishing-detection")
@@ -167,40 +199,57 @@ def phishing_detection(request: URLRequest):
     url = request.url.strip()
 
     if not url:
-        raise HTTPException(status_code=400, detail="URL is required.")
+        raise HTTPException(
+            status_code=400,
+            detail="URL is required.",
+        )
 
-    prediction = int(phishing_model.predict([url])[0])
+    encoded_url = encode_url(url)
 
-    probabilities = phishing_model.predict_proba([url])[0]
-    confidence = float(max(probabilities))
+    # CNN sigmoid output: probability of label 1 (Legitimate)
+    legitimate_probability = float(
+        phishing_model.predict(
+            encoded_url,
+            verbose=0,
+        )[0][0]
+    )
 
-    if prediction == 0:
+    phishing_probability = 1.0 - legitimate_probability
+
+    if phishing_probability >= 0.5:
         result = "Phishing"
+        confidence = phishing_probability
         message = (
-            "The model classified this URL as phishing. "
+            "The CNN model classified this URL as phishing. "
             "Do not enter sensitive information on this website."
         )
+        label = 0
     else:
         result = "Legitimate"
+        confidence = legitimate_probability
         message = (
-            "The model classified this URL as legitimate. "
+            "The CNN model classified this URL as legitimate. "
             "This does not guarantee that the website is safe."
         )
+        label = 1
 
     save_scan(
         scan_type="Phishing",
         target=url,
         prediction=result,
         confidence=confidence,
-        details=message
+        details=message,
     )
 
     return {
         "url": url,
         "prediction": result,
-        "label": prediction,
-        "confidence": confidence,
+        "label": label,
+        "confidence": round(confidence, 4),
+        "phishing_probability": round(phishing_probability, 4),
+        "legitimate_probability": round(legitimate_probability, 4),
         "message": message,
+        "model": "CNN Deep Learning",
     }
 
 
@@ -212,13 +261,12 @@ def phishing_detection(request: URLRequest):
 def intrusion_detection(request: IntrusionRequest):
     ensure_model_loaded(intrusion_model, "Intrusion detection")
 
-    features = request.features
-
     try:
-        input_df = pd.DataFrame([features])
+        input_df = pd.DataFrame([request.features])
         probabilities = intrusion_model.predict_proba(input_df)[0]
 
         attack_probability = float(probabilities[1])
+
         prediction = (
             "Attack"
             if attack_probability >= INTRUSION_THRESHOLD
@@ -228,7 +276,7 @@ def intrusion_detection(request: IntrusionRequest):
     except Exception as error:
         raise HTTPException(
             status_code=400,
-            detail=f"Invalid intrusion features: {str(error)}"
+            detail=f"Invalid intrusion features: {str(error)}",
         )
 
     message = (
@@ -242,19 +290,19 @@ def intrusion_detection(request: IntrusionRequest):
         target="Supplied network traffic features",
         prediction=prediction,
         confidence=attack_probability,
-        details=message
+        details=message,
     )
 
     return {
         "prediction": prediction,
-        "attack_probability": attack_probability,
+        "attack_probability": round(attack_probability, 4),
         "threshold": INTRUSION_THRESHOLD,
         "message": message,
     }
 
 
 # --------------------------------------------------
-# Malware Classification (JSON features)
+# Malware Classification — JSON features
 # --------------------------------------------------
 
 @app.post("/api/malware-classification")
@@ -274,12 +322,13 @@ def malware_classification(request: MalwareRequest):
                 detail={
                     "message": "Missing required malware features.",
                     "missing_features": missing_features,
-                }
+                },
             )
 
         input_df = pd.DataFrame(
-            [[request.features[column] for column in malware_feature_columns]],
-            columns=malware_feature_columns
+            [[request.features[column]
+              for column in malware_feature_columns]],
+            columns=malware_feature_columns,
         )
 
         probabilities = malware_model.predict_proba(input_df)[0]
@@ -294,7 +343,7 @@ def malware_classification(request: MalwareRequest):
     except Exception as error:
         raise HTTPException(
             status_code=400,
-            detail=f"Invalid malware features: {str(error)}"
+            detail=f"Invalid malware features: {str(error)}",
         )
 
     message = (
@@ -311,14 +360,14 @@ def malware_classification(request: MalwareRequest):
         target="JSON feature input",
         prediction=prediction,
         confidence=confidence,
-        details=message
+        details=message,
     )
 
     return {
         "prediction": prediction,
         "label": label,
-        "confidence": confidence,
-        "malware_probability": malware_probability,
+        "confidence": round(confidence, 4),
+        "malware_probability": round(malware_probability, 4),
         "message": message,
     }
 
@@ -336,7 +385,7 @@ async def malware_scan_exe(file: UploadFile = File(...)):
     if not filename.lower().endswith(".exe"):
         raise HTTPException(
             status_code=400,
-            detail="Only .exe files are supported."
+            detail="Only .exe files are supported.",
         )
 
     temp_path = None
@@ -345,7 +394,7 @@ async def malware_scan_exe(file: UploadFile = File(...)):
     try:
         with tempfile.NamedTemporaryFile(
             delete=False,
-            suffix=".exe"
+            suffix=".exe",
         ) as temp_file:
             temp_path = temp_file.name
 
@@ -360,7 +409,7 @@ async def malware_scan_exe(file: UploadFile = File(...)):
                 if file_size > MAX_FILE_SIZE:
                     raise HTTPException(
                         status_code=413,
-                        detail="File size must not exceed 100 MB."
+                        detail="File size must not exceed 100 MB.",
                     )
 
                 temp_file.write(chunk)
@@ -377,15 +426,17 @@ async def malware_scan_exe(file: UploadFile = File(...)):
             raise HTTPException(
                 status_code=500,
                 detail={
-                    "message": "PE feature extractor is missing model features.",
+                    "message": (
+                        "PE feature extractor is missing model features."
+                    ),
                     "missing_features": missing_features,
-                }
+                },
             )
 
         input_df = pd.DataFrame(
             [[extracted_features[column]
               for column in malware_feature_columns]],
-            columns=malware_feature_columns
+            columns=malware_feature_columns,
         )
 
         probabilities = malware_model.predict_proba(input_df)[0]
@@ -409,7 +460,7 @@ async def malware_scan_exe(file: UploadFile = File(...)):
             target=filename,
             prediction=prediction,
             confidence=confidence,
-            details=message
+            details=message,
         )
 
         return {
@@ -417,8 +468,8 @@ async def malware_scan_exe(file: UploadFile = File(...)):
             "file_size": file_size,
             "prediction": prediction,
             "label": label,
-            "confidence": confidence,
-            "malware_probability": malware_probability,
+            "confidence": round(confidence, 4),
+            "malware_probability": round(malware_probability, 4),
             "message": message,
         }
 
@@ -427,7 +478,7 @@ async def malware_scan_exe(file: UploadFile = File(...)):
     except Exception as error:
         raise HTTPException(
             status_code=400,
-            detail=f"Unable to analyze EXE file: {str(error)}"
+            detail=f"Unable to analyze EXE file: {str(error)}",
         )
     finally:
         await file.close()
@@ -444,17 +495,17 @@ async def malware_scan_exe(file: UploadFile = File(...)):
 def threat_classification(request: MalwareRequest):
     return malware_classification(request)
 
+
 # --------------------------------------------------
 # Scan History API
 # --------------------------------------------------
 
 @app.get("/api/scan-history")
 def get_scan_history(limit: int = 100):
-
     if limit < 1 or limit > 500:
         raise HTTPException(
             status_code=400,
-            detail="Limit must be between 1 and 500."
+            detail="Limit must be between 1 and 500.",
         )
 
     connection = get_connection()
@@ -469,7 +520,7 @@ def get_scan_history(limit: int = 100):
             ORDER BY id DESC
             LIMIT ?
             """,
-            (limit,)
+            (limit,),
         )
 
         scans = cursor.fetchall()
@@ -480,7 +531,7 @@ def get_scan_history(limit: int = 100):
         return {
             "total_scans": total_scans,
             "showing": len(scans),
-            "scans": [dict(scan) for scan in scans]
+            "scans": [dict(scan) for scan in scans],
         }
 
     finally:
