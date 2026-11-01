@@ -1,0 +1,32 @@
+# Python virtual environment
+csip_env/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Environment variables
+.env
+.env.*
+
+# IDE files
+.vscode/
+
+# Jupyter files
+.ipynb_checkpoints/
+
+# Temporary files
+*.tmp
+*.log
+
+# Operating system
+.DS_Store
+Thumbs.db
+
+# Training datasets (not needed for deployment)
+datasets/
+
+# Generated outputs
+outputs/
