@@ -10,4 +10,4 @@ scipy==1.15.3
 scikit-learn==1.7.2
 pefile==2024.8.26
 yara-python==4.5.4
-tensorflow-cpu==2.15.1
+tensorflow-cpu==2.16.1
